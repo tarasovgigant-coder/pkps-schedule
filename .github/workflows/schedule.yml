@@ -1,0 +1,32 @@
+name: Обновление расписания ПКПС
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pkps-import
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python -m pip install xlrd==2.0.2
+
+      - run: python ingest.py
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }}
