@@ -68,7 +68,7 @@ def request(url,body=None,secret=None):
   except Exception:
    if attempt==2:raise
    time.sleep(2*(attempt+1))
-def main():
+def import_design():
  from urllib.parse import urljoin,urlsplit
  worker=os.environ['WORKER_URL'].rstrip('/');secret=os.environ['IMPORT_SECRET']
  if not worker.startswith('https://'):raise ValueError('WORKER_URL должен начинаться с https://')
@@ -93,4 +93,107 @@ def main():
   print(k,'импортировано групп:',len(groups))
  request(worker+'/complete',{'dates':selected[1:]},secret)
  print('Обновление завершено')
+
+FP_PAGE='https://pkps-perm.ru/students/raspisanie/fakultet_predprinimatelstva_ul_permskaya_226/'
+
+def fp_parse(raw, expected_date):
+ from io import BytesIO
+ import openpyxl, warnings
+ with warnings.catch_warnings():
+  warnings.simplefilter('ignore', UserWarning)
+  book=openpyxl.load_workbook(BytesIO(raw),data_only=True)
+ out={}
+ for sheet in book:
+  if not re.search(r'курс',sheet.title,re.I):continue
+  def cell(r,c):
+   value=sheet.cell(r,c).value
+   if value is not None:return str(value).strip()
+   for merged in sheet.merged_cells.ranges:
+    if merged.min_row<=r<=merged.max_row and merged.min_col<=c<=merged.max_col:
+     return str(sheet.cell(merged.min_row,merged.min_col).value or '').strip()
+   return ''
+  header=next((r for r in range(1,min(sheet.max_row,30)+1) if sum(bool(GROUP.fullmatch(key(cell(r,c)))) for c in range(3,sheet.max_column+1))>=2),None)
+  if not header:continue
+  dates=re.findall(r'\b(\d{2})\.(\d{2})\.(\d{4})\b',' '.join(cell(r,c) for r in range(1,header) for c in range(1,sheet.max_column+1)))
+  if expected_date not in [f'{y}-{m}-{d}' for d,m,y in dates]:raise ValueError('Дата внутри Excel не совпадает со ссылкой: '+expected_date)
+  for c in range(3,sheet.max_column+1):
+   name=key(cell(header,c))
+   if not GROUP.fullmatch(name):continue
+   course=0
+   for r in range(header-1,0,-1):
+    match=re.search(r'\b([1-4])\s*курс',cell(r,c),re.I)
+    if match:course=int(match[1]);break
+   if not course:raise ValueError('Не определён курс: '+name)
+   lessons={};day='';starts=[]
+   for r in range(header+1,sheet.max_row+1):
+    value=cell(r,1).lower()
+    if value in DAYS:day=value
+    match=re.match(r'^\s*(VIII|VII|VI|IV|III|II|V|I|[1-8])\b',str(sheet.cell(r,2).value or ''),re.I)
+    if match and day:
+     num={'I':1,'II':2,'III':3,'IV':4,'V':5,'VI':6,'VII':7,'VIII':8}.get(match[1].upper(),int(match[1]) if match[1].isdigit() else 0)
+     clock=re.search(r'(\d{1,2})[.:](\d{2})',cell(r,2))
+     starts.append((r,day,num,f'{int(clock[1]):02}:{clock[2]}' if clock else ''))
+   for i,(r,day,num,clock) in enumerate(starts):
+    end=starts[i+1][0] if i+1<len(starts) else sheet.max_row+1
+    # Предмет и преподаватель/кабинет расположены на отдельных строках.
+    parts=[]
+    for rr in range(r,end):
+     text=cell(rr,c)
+     if text and text not in parts:parts.append(text)
+    if parts:lessons.setdefault(day,[]).append({'day':day,'number':num,'time':clock,'text':'\n'.join(parts),'subgroup':None})
+   out['FP~'+name]={'group':name,'course':course,'faculty':'fp','days':lessons,'present':True}
+ if not out:raise ValueError('Группы факультета предпринимательства не найдены')
+ return out
+
+def fp_documents(html):
+ from urllib.parse import urljoin,urlsplit,quote,unquote
+ links=Links();links.feed(html);dated={};pdfs={}
+ for href,title in links.links:
+  url=quote(unquote(urljoin(FP_PAGE,unescape(href))),safe=':/');title=' '.join(title.split())
+  if urlsplit(url).netloc!=urlsplit(FP_PAGE).netloc:continue
+  if urlsplit(url).path.lower().endswith('.pdf'):
+   nums=[int(v) for v in re.findall(r'\b[1-4]\b',title)]
+   for course in nums:pdfs[course]=url
+  date=re.search(r'(\d{2})\.(\d{2})\.(\d{4})',title)
+  if date and urlsplit(url).path.lower().endswith('.xlsx') and re.search(r'изменени|расписан',title,re.I):
+   k=f'{date[3]}-{date[2]}-{date[1]}';dated.setdefault(k,{'url':url,'title':title})
+ if set(pdfs)!={1,2,3,4} or not dated:raise ValueError('Неполный список источников предпринимательства')
+ return pdfs,dated
+
+def import_enterprise():
+ worker=os.environ['WORKER_URL'].rstrip('/');secret=os.environ['IMPORT_SECRET']
+ manifest=json.loads(request(worker+'/manifest',{},secret))
+ pdfs,docs=fp_documents(request(FP_PAGE).decode('utf-8'))
+ selected=sorted(docs,reverse=True)[:10]
+ # Свежий Excel содержит полный список групп и их курсов.
+ newest=selected[0];raw=request(docs[newest]['url']);roster=fp_parse(raw,newest)
+ pdf_hash={}
+ for url in set(pdfs.values()):pdf_hash[url]=hashlib.sha256(request(url)).hexdigest()
+ groups={}
+ for gid,g in roster.items():
+  url=pdfs[g['course']]
+  groups[gid]={**g,'days':{},'pdf':True,'url':url,'source_hash':pdf_hash[url]}
+ payload={'groups':groups,'url':FP_PAGE,'title':'Основное расписание факультета предпринимательства (PDF)'}
+ digest=hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+ def send(k,h,data):
+  if manifest.get(k)==h:print(k,'без изменений');return
+  result=json.loads(request(worker+'/import',{'key':k,'hash':h,'data':data},secret))
+  if not result.get('ok'):raise ValueError('Ошибка импорта '+k)
+  print(k,'импортировано групп:',len(data['groups']))
+ send('fp:base',digest,payload)
+ for date in selected:
+  doc=docs[date];data=raw if date==newest else request(doc['url']);digest=hashlib.sha256(data).hexdigest()
+  if manifest.get('fp:'+date)==digest:print('fp:'+date,'без изменений');continue
+  parsed=roster if date==newest else fp_parse(data,date)
+  send('fp:'+date,digest,{'groups':parsed,'url':doc['url'],'title':doc['title']})
+ request(worker+'/complete',{'faculty':'fp','dates':selected},secret)
+ print('Факультет предпринимательства обновлён')
+
+def main():
+ failures=[]
+ for name,job in [('Дизайна и сервиса',import_design),('Предпринимательства',import_enterprise)]:
+  try:job()
+  except Exception as err:failures.append(name+': '+str(err))
+ if failures:raise RuntimeError('; '.join(failures))
+
 if __name__=='__main__':main()
